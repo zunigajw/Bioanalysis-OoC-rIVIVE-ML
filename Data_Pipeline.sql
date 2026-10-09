@@ -35,7 +35,7 @@ CREATE TABLE morgan_fingerprints (
   bitstring   TEXT NOT NULL    -- n_bits characters of 0/1, bit 0 first
 );
 
--- chembl.py: matched molecule, mechanism targets, ADME (assay type A) and binding (assay type B).
+-- chembl.py: matched molecule, mechanism targets, individual ADME parameters and binding.
 CREATE TABLE chembl_molecules (
   compound_id        INTEGER PRIMARY KEY REFERENCES compounds (compound_id),
   molecule_chembl_id TEXT,
@@ -57,11 +57,30 @@ CREATE TABLE chembl_mechanisms (
   PRIMARY KEY (compound_id, mec_id)
 );
 
-CREATE TABLE chembl_activities (
+-- Individual ADME parameters (human assays only), one row per reported value.
+CREATE TABLE chembl_adme (
   compound_id        INTEGER NOT NULL REFERENCES compounds (compound_id),
   activity_id        INTEGER NOT NULL,
   molecule_chembl_id TEXT NOT NULL,
-  assay_type         TEXT NOT NULL CHECK (assay_type IN ('A', 'B')),
+  adme_group         TEXT NOT NULL CHECK (adme_group IN ('Absorption', 'Distribution', 'Metabolism', 'Excretion')),
+  parameter          TEXT NOT NULL,   -- ChEMBL standard_type, e.g. F, Fu, CL, T1/2, CL_renal
+  relation           TEXT,            -- =, <, >, ~
+  value              REAL,
+  upper_value        REAL,            -- upper end when a range was reported
+  units              TEXT,
+  error_reported     TEXT,            -- SD / SEM / CI exactly as reported in ChEMBL; never calculated
+  assay_chembl_id    TEXT,
+  assay_description  TEXT,
+  assay_organism     TEXT,
+  document_chembl_id TEXT,
+  PRIMARY KEY (compound_id, activity_id)
+);
+
+-- Binding records (assay type B) that have a pChEMBL value.
+CREATE TABLE chembl_binding (
+  compound_id        INTEGER NOT NULL REFERENCES compounds (compound_id),
+  activity_id        INTEGER NOT NULL,
+  molecule_chembl_id TEXT NOT NULL,
   assay_chembl_id    TEXT,
   assay_description  TEXT,
   standard_type      TEXT,
@@ -76,22 +95,10 @@ CREATE TABLE chembl_activities (
   PRIMARY KEY (compound_id, activity_id)
 );
 
-CREATE VIEW chembl_adme AS
-  SELECT * FROM chembl_activities WHERE assay_type = 'A';
-
-CREATE VIEW chembl_protein_binding AS
-  SELECT * FROM chembl_activities
-  WHERE assay_type = 'A'
-    AND LOWER(standard_type) IN ('fu', 'ppb', 'fraction unbound', 'unbound fraction',
-                                 'protein binding', 'plasma protein binding');
-
-CREATE VIEW chembl_binding AS
-  SELECT * FROM chembl_activities WHERE assay_type = 'B';
-
 CREATE VIEW chembl_target_summary AS
   SELECT compound_id, target_chembl_id, target_pref_name, target_organism,
          COUNT(*) AS n_activities, AVG(pchembl_value) AS mean_pchembl, MAX(pchembl_value) AS max_pchembl
-  FROM chembl_activities WHERE assay_type = 'B'
+  FROM chembl_binding
   GROUP BY compound_id, target_chembl_id;
 
 -- ice.py: plasma fraction unbound used by the ICE IVIVE tool (httk measured, OPERA predicted).

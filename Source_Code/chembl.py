@@ -1,14 +1,14 @@
-"""ChEMBL database: biological targets, ADME properties and protein-binding parameters.
+"""ChEMBL database: biological targets and individual ADME parameters (human), including protein binding.
 
 Each compound is matched to one ChEMBL molecule: exact InChIKey, then same skeleton (first InChIKey
 block), then name, then synonym; salt forms are replaced by their parent. For that molecule:
-  mechanisms of action + targets          -> chembl_mechanisms
-  ADME records (assay type A)             -> chembl_activities, assay_type 'A'
-  binding records with pChEMBL (type B)   -> chembl_activities, assay_type 'B'
-Protein-binding parameters (Fu, PPB) are the ADME records in view chembl_protein_binding.
+  mechanisms of action + targets                 -> chembl_mechanisms
+  each ADME parameter in ADME, human assays only -> chembl_adme (one spreadsheet sheet per parameter)
+  binding records with pChEMBL (assay type B)    -> chembl_binding
+Errors (SD, SEM, CI) are copied only where ChEMBL reports them; nothing is calculated.
 
 Input : table compounds; ChEMBL web services (replies cached in output/cache/chembl)
-Output: tables chembl_molecules, chembl_mechanisms, chembl_activities, and output/chembl.xlsx
+Output: tables chembl_molecules, chembl_mechanisms, chembl_adme, chembl_binding, and output/chembl.xlsx
 Usage : python Source_Code/chembl.py <database.db>
 """
 import hashlib
@@ -23,11 +23,18 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+ADME = {"Absorption": ["F", "Fa", "Papp", "Tmax", "Cmax", "AUC"],
+        "Distribution": ["Fu", "PPB", "Vdss", "Vd"],
+        "Metabolism": ["CL", "CLH", "T1/2", "MRT", "Stability", "Km", "Vmax"],
+        "Excretion": ["CL_renal", "Drug excretion"]}
+GROUP = {parameter: group for group, parameters in ADME.items() for parameter in parameters}
+ERRORS = {"SD", "SEM", "SE", "S.D.", "S.E.M.", "CI", "CI_LOWER", "CI_UPPER", "CV", "ERROR"}
 API = "https://www.ebi.ac.uk/chembl/api/data"
 MOLECULE = "molecule_chembl_id,pref_name,max_phase,molecule_hierarchy"
-ACTIVITY = ("activity_id,assay_chembl_id,assay_description,assay_type,standard_type,standard_relation,"
-            "standard_value,standard_units,pchembl_value,target_chembl_id,target_pref_name,"
-            "target_organism,document_chembl_id")
+ADME_FIELDS = ("activity_id,assay_chembl_id,assay_description,standard_type,standard_relation,standard_value,"
+               "standard_upper_value,standard_units,document_chembl_id,activity_properties")
+BINDING_FIELDS = ("activity_id,assay_chembl_id,assay_description,standard_type,standard_relation,standard_value,"
+                  "standard_units,pchembl_value,target_chembl_id,target_pref_name,target_organism,document_chembl_id")
 db = Path(sys.argv[1])
 CACHE = db.parent / "cache" / "chembl"
 
@@ -97,12 +104,13 @@ def fetch(c):
     m, method = match(c)
     cid = m.get("molecule_chembl_id")
     if not cid:
-        return c.compound_id, m, method, [], []
-    mechanisms = get_all("mechanism", "mechanisms", molecule_chembl_id=cid)
-    activities = (get_all("activity", "activities", molecule_chembl_id=cid, assay_type="A", only=ACTIVITY)
-                  + get_all("activity", "activities", molecule_chembl_id=cid, assay_type="B",
-                            pchembl_value__isnull="false", only=ACTIVITY))
-    return c.compound_id, m, method, mechanisms, activities
+        return c.compound_id, m, method, [], [], []
+    return (c.compound_id, m, method,
+            get_all("mechanism", "mechanisms", molecule_chembl_id=cid),
+            get_all("activity", "activities", molecule_chembl_id=cid, assay_type="A",
+                    standard_type__in=",".join(GROUP), only=ADME_FIELDS),
+            get_all("activity", "activities", molecule_chembl_id=cid, assay_type="B",
+                    pchembl_value__isnull="false", only=BINDING_FIELDS))
 
 
 def num(x):
@@ -110,6 +118,18 @@ def num(x):
         return float(x)
     except (TypeError, ValueError):
         return None
+
+
+def errors(record):
+    """Error terms exactly as ChEMBL reports them in the record's properties."""
+    found = []
+    for p in record.get("activity_properties") or []:
+        kind = (p.get("standard_type") or p.get("type") or "").upper()
+        if kind in ERRORS or "DEVIATION" in kind or "ERROR" in kind or "CONFIDENCE" in kind:
+            value = p.get("standard_value") or p.get("value") or p.get("standard_text_value") or ""
+            found.append(" ".join(str(s) for s in (kind, p.get("standard_relation") or "", value,
+                                                   p.get("standard_units") or p.get("units") or "") if s))
+    return "; ".join(found) or None
 
 
 con = sqlite3.connect(db)
@@ -122,12 +142,20 @@ with ThreadPoolExecutor(max_workers=4) as pool:
         if len(results) % 25 == 0:
             print(f"    ChEMBL: {len(results)}/{len(compounds)} compounds")
 
-target_ids = sorted({x["target_chembl_id"] for r in results for x in r[3] if x.get("target_chembl_id")})
-targets = {t["target_chembl_id"]: t for i in range(0, len(target_ids), 50)
-           for t in get_all("target", "targets", target_chembl_id__in=",".join(target_ids[i:i + 50]),
-                            only="target_chembl_id,pref_name,target_type,organism")}
 
-for compound_id, m, method, mechanisms, activities in results:
+def lookup(endpoint, key, id_field, ids, fields):
+    ids = sorted(ids)
+    return {x[id_field]: x for i in range(0, len(ids), 50)
+            for x in get_all(endpoint, key, only=fields, **{f"{id_field}__in": ",".join(ids[i:i + 50])})}
+
+
+targets = lookup("target", "targets", "target_chembl_id",
+                 {x["target_chembl_id"] for r in results for x in r[3] if x.get("target_chembl_id")},
+                 "target_chembl_id,pref_name,target_type,organism")
+assays = lookup("assay", "assays", "assay_chembl_id", {a["assay_chembl_id"] for r in results for a in r[4]},
+                "assay_chembl_id,assay_organism,assay_tax_id")
+
+for compound_id, m, method, mechanisms, adme, binding in results:
     cid = m.get("molecule_chembl_id")
     con.execute("INSERT INTO chembl_molecules VALUES (?, ?, ?, ?, ?)",
                 (compound_id, cid, m.get("pref_name"), num(m.get("max_phase")), method))
@@ -136,38 +164,69 @@ for compound_id, m, method, mechanisms, activities in results:
         con.execute("INSERT INTO chembl_mechanisms VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (compound_id, x["mec_id"], cid, x.get("mechanism_of_action"), x.get("action_type"),
                      x.get("target_chembl_id"), t.get("pref_name"), t.get("target_type"), t.get("organism")))
-    for a in {a["activity_id"]: a for a in activities}.values():
-        con.execute("INSERT INTO chembl_activities VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (compound_id, a["activity_id"], cid, a["assay_type"], a.get("assay_chembl_id"),
-                     a.get("assay_description"), a.get("standard_type"), a.get("standard_relation"),
-                     num(a.get("standard_value")), a.get("standard_units"), num(a.get("pchembl_value")),
-                     a.get("target_chembl_id"), a.get("target_pref_name"), a.get("target_organism"),
-                     a.get("document_chembl_id")))
+    for a in {a["activity_id"]: a for a in adme}.values():
+        assay = assays.get(a["assay_chembl_id"], {})
+        if str(assay.get("assay_tax_id")) != "9606" or a["standard_type"] not in GROUP:   # human assays only
+            continue
+        con.execute("INSERT INTO chembl_adme VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (compound_id, a["activity_id"], cid, GROUP[a["standard_type"]], a["standard_type"],
+                     a.get("standard_relation"), num(a.get("standard_value")), num(a.get("standard_upper_value")),
+                     a.get("standard_units"), errors(a), a.get("assay_chembl_id"), a.get("assay_description"),
+                     assay.get("assay_organism"), a.get("document_chembl_id")))
+    for a in {a["activity_id"]: a for a in binding}.values():
+        con.execute("INSERT INTO chembl_binding VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (compound_id, a["activity_id"], cid, a.get("assay_chembl_id"), a.get("assay_description"),
+                     a.get("standard_type"), a.get("standard_relation"), num(a.get("standard_value")),
+                     a.get("standard_units"), num(a.get("pchembl_value")), a.get("target_chembl_id"),
+                     a.get("target_pref_name"), a.get("target_organism"), a.get("document_chembl_id")))
 release = f"{status['chembl_db_version']} ({status['chembl_release_date']})"
 retrieved = json.loads(cached("status", {}).read_text())["retrieved_utc"]
 con.execute("INSERT INTO sources VALUES (?, ?, ?, ?)", ("ChEMBL", release, retrieved, API))
 con.commit()
 
-named = "SELECT c.name, t.* FROM ({}) t JOIN compounds c USING (compound_id) ORDER BY t.compound_id"
-counts = ", ".join(f"(SELECT COUNT(*) FROM {v} x WHERE x.compound_id = c.compound_id) AS n_{v[7:]}"
-                   for v in ("chembl_mechanisms", "chembl_adme", "chembl_protein_binding", "chembl_binding"))
+# Spreadsheet: summary (every value listed), one sheet per ADME parameter, targets, binding.
+adme = pd.read_sql("SELECT c.name, a.* FROM chembl_adme a JOIN compounds c USING (compound_id) "
+                   "ORDER BY a.compound_id, a.activity_id", con)
+
+
+def shown(r):
+    relation = "" if r.relation in (None, "=") else r.relation
+    upper = f"-{r.upper_value:g}" if pd.notna(r.upper_value) else ""
+    value = f"{r.value:g}" if pd.notna(r.value) else "?"
+    return f"{relation}{value}{upper} {r.units or ''}".strip()
+
+
+adme["shown"] = [shown(r) for r in adme.itertuples(index=False)]
+summary = adme.groupby(["compound_id", "parameter"])["shown"].agg("; ".join).unstack()
+summary = compounds[["compound_id", "name"]].merge(
+    summary.reindex(columns=list(GROUP)).reset_index(), on="compound_id", how="left")
+summary.columns = ["compound_id", "name"] + [f"{GROUP[p]}: {p}" for p in GROUP]
+
+named = "SELECT c.name, t.* FROM {} t JOIN compounds c USING (compound_id) ORDER BY t.compound_id"
 sheets = {
-    "Molecules": f"SELECT c.compound_id, c.name, c.inchikey, m.molecule_chembl_id, m.pref_name, m.max_phase, "
-                 f"m.match_method, {counts} FROM compounds c JOIN chembl_molecules m USING (compound_id) "
-                 f"ORDER BY c.compound_id",
-    "Mechanism targets": named.format("SELECT * FROM chembl_mechanisms"),
-    "ADME": named.format("SELECT * FROM chembl_adme"),
-    "Protein binding": named.format("SELECT * FROM chembl_protein_binding"),
-    "Binding target summary": named.format("SELECT * FROM chembl_target_summary"),
-    "Binding (pChEMBL)": named.format("SELECT * FROM chembl_binding"),
+    "Molecules": pd.read_sql(
+        "SELECT c.compound_id, c.name, c.inchikey, m.molecule_chembl_id, m.pref_name, m.max_phase, m.match_method, "
+        "(SELECT COUNT(*) FROM chembl_mechanisms x WHERE x.compound_id = c.compound_id) AS n_mechanisms, "
+        "(SELECT COUNT(*) FROM chembl_adme x WHERE x.compound_id = c.compound_id) AS n_adme_human, "
+        "(SELECT COUNT(*) FROM chembl_binding x WHERE x.compound_id = c.compound_id) AS n_binding "
+        "FROM compounds c JOIN chembl_molecules m USING (compound_id) ORDER BY c.compound_id", con),
+    "ADME summary": summary,
 }
+for p in GROUP:
+    sheets[f"{GROUP[p][0]} {p}".replace("/", "-")] = adme[adme.parameter == p].drop(columns="shown")
+sheets["Mechanism targets"] = pd.read_sql(named.format("chembl_mechanisms"), con)
+sheets["Binding target summary"] = pd.read_sql(named.format("chembl_target_summary"), con)
+sheets["Binding (pChEMBL)"] = pd.read_sql(named.format("chembl_binding"), con)
+sheets["Source"] = pd.DataFrame(
+    [["ChEMBL release", release], ["First downloaded (UTC)", retrieved], ["Web services", API],
+     ["Matching", "exact InChIKey > same skeleton > name > synonym; '_parent' = salt replaced by parent"],
+     ["ADME parameters", "; ".join(f"{g}: {', '.join(p)}" for g, p in ADME.items())],
+     ["ADME species", "human only (assay taxonomy 9606)"],
+     ["Errors", "SD / SEM / CI copied only where ChEMBL reports them; none calculated"],
+     ["Sheet names", "A = Absorption, D = Distribution, M = Metabolism, E = Excretion"],
+     ["Binding", "assay type B records that have a pChEMBL value"]], columns=["Item", "Value"])
 with pd.ExcelWriter(db.parent / "chembl.xlsx") as xl:
-    for sheet, sql in sheets.items():
-        pd.read_sql(sql, con).to_excel(xl, sheet_name=sheet, index=False)
-    pd.DataFrame([["ChEMBL release", release], ["First downloaded (UTC)", retrieved], ["Web services", API],
-                  ["Matching", "exact InChIKey > same skeleton > name > synonym; '_parent' = salt replaced by parent"],
-                  ["Protein binding", "ADME records with standard_type Fu or PPB"],
-                  ["Binding", "assay type B records that have a pChEMBL value"]],
-                 columns=["Item", "Value"]).to_excel(xl, sheet_name="Source", index=False)
+    for sheet, df in sheets.items():
+        df.to_excel(xl, sheet_name=sheet, index=False)
 matched = sum(1 for r in results if r[1])
-print(f"chembl: {release}, {matched}/{len(results)} compounds matched -> chembl.xlsx")
+print(f"chembl: {release}, {matched}/{len(results)} compounds matched, {len(adme)} human ADME values -> chembl.xlsx")
