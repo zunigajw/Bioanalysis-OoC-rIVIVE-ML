@@ -1,0 +1,22 @@
+# Database Curation on GitHub: on every upload, run `just` exactly as a fresh clone would
+# (Podman is preinstalled on GitHub's Ubuntu machines), then attach the database and spreadsheets.
+name: Database Curation
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install just
+        run: curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | sudo bash -s -- --to /usr/local/bin
+      - name: just
+        run: just
+      - uses: actions/upload-artifact@v4
+        with:
+          name: database-and-spreadsheets
+          path: |
+            output/*.db
+            output/*.xlsx

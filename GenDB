@@ -1,0 +1,23 @@
+# GenDB: builds output/ooc_drug_ml.db plus one spreadsheet per database in output/.
+# Called by the justfile inside the Podman container (make -f GenDB).
+PYTHON ?= python
+OUT    := output
+DB     := $(OUT)/ooc_drug_ml.db
+TMP    := $(OUT)/building.db
+
+.PHONY: all clean
+all: $(DB)
+
+# Starts from an empty database every time and replaces the old one only if every step succeeds,
+# so running it again gives the same database. Downloads are cached in output/cache.
+$(DB): Data_Pipeline.sql requirements.txt $(wildcard Source_Code/*.py) $(wildcard Project_Files/*)
+	mkdir -p $(OUT)
+	rm -f $(TMP)
+	$(PYTHON) -c "import sqlite3; sqlite3.connect('$(TMP)').executescript(open('Data_Pipeline.sql').read())"
+	$(PYTHON) Source_Code/rdkit_features.py $(TMP)
+	$(PYTHON) Source_Code/chembl.py $(TMP)
+	$(PYTHON) Source_Code/ice.py $(TMP)
+	mv $(TMP) $(DB)
+
+clean:
+	rm -rf $(OUT)
