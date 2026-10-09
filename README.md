@@ -12,6 +12,7 @@ Requires `git`, `podman` and `just` (see the course setup). Everything else runs
 ## Pipeline flow
 
 ```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 460, "nodeSpacing": 30, "rankSpacing": 45, "padding": 18}}}%%
 flowchart TD
     J["<b>justfile</b> (Database Curation)<br/>the one command: just"]
     C["<b>Containerfile</b> (Podman)<br/>builds the same Linux environment on any computer:<br/>Python 3.12, RDKit, pandas, pinned versions"]
