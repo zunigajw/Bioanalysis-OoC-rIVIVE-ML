@@ -7,7 +7,7 @@ RUN apt-get update && \
 
 # Python packages, pinned for reproducibility.
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+RUN pip install --no-cache-dir --root-user-action=ignore -r /tmp/requirements.txt
 
 # Show each script's progress as it runs.
 ENV PYTHONUNBUFFERED=1
