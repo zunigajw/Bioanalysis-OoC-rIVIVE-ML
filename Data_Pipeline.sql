@@ -72,6 +72,8 @@ CREATE TABLE chembl_adme (
   assay_chembl_id    TEXT,
   assay_description  TEXT,
   assay_organism     TEXT,
+  assay_format       TEXT,            -- ChEMBL BAO format, e.g. organism-based, microsome, cell-based
+  system             TEXT NOT NULL CHECK (system IN ('in vivo', 'in vitro', 'unspecified')),
   document_chembl_id TEXT,
   PRIMARY KEY (compound_id, activity_id)
 );

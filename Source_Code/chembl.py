@@ -3,9 +3,11 @@
 Each compound is matched to one ChEMBL molecule: exact InChIKey, then same skeleton (first InChIKey
 block), then name, then synonym; salt forms are replaced by their parent. For that molecule:
   mechanisms of action + targets                 -> chembl_mechanisms
-  each ADME parameter in ADME, human assays only -> chembl_adme (one spreadsheet sheet per parameter)
+  each ADME parameter in ADME, human assays only -> chembl_adme (sheets per parameter and in vivo / in vitro)
   binding records with pChEMBL (assay type B)    -> chembl_binding
 Errors (SD, SEM, CI) are copied only where ChEMBL reports them; nothing is calculated.
+Each ADME value is labelled from ChEMBL's assay format: organism-based = in vivo, no format given = unspecified,
+any other format (microsome, cell, cell-free, tissue, protein) = in vitro.
 
 Input : table compounds; ChEMBL web services (replies cached in output/cache/chembl)
 Output: tables chembl_molecules, chembl_mechanisms, chembl_adme, chembl_binding, and output/chembl.xlsx
@@ -28,6 +30,7 @@ ADME = {"Absorption": ["F", "Fa", "Papp", "Tmax", "Cmax", "AUC"],
         "Metabolism": ["CL", "CLH", "T1/2", "MRT", "Stability", "Km", "Vmax"],
         "Excretion": ["CL_renal", "Drug excretion"]}
 GROUP = {parameter: group for group, parameters in ADME.items() for parameter in parameters}
+SYSTEMS = ["in vivo", "in vitro", "unspecified"]
 ERRORS = {"SD", "SEM", "SE", "S.D.", "S.E.M.", "CI", "CI_LOWER", "CI_UPPER", "CV", "ERROR"}
 API = "https://www.ebi.ac.uk/chembl/api/data"
 MOLECULE = "molecule_chembl_id,pref_name,max_phase,molecule_hierarchy"
@@ -153,7 +156,12 @@ targets = lookup("target", "targets", "target_chembl_id",
                  {x["target_chembl_id"] for r in results for x in r[3] if x.get("target_chembl_id")},
                  "target_chembl_id,pref_name,target_type,organism")
 assays = lookup("assay", "assays", "assay_chembl_id", {a["assay_chembl_id"] for r in results for a in r[4]},
-                "assay_chembl_id,assay_organism,assay_tax_id")
+                "assay_chembl_id,assay_organism,assay_tax_id,bao_label")
+
+
+def system(fmt):
+    return "in vivo" if fmt == "organism-based format" else "unspecified" if fmt in (None, "assay format") \
+        else "in vitro"
 
 for compound_id, m, method, mechanisms, adme, binding in results:
     cid = m.get("molecule_chembl_id")
@@ -168,11 +176,12 @@ for compound_id, m, method, mechanisms, adme, binding in results:
         assay = assays.get(a["assay_chembl_id"], {})
         if str(assay.get("assay_tax_id")) != "9606" or a["standard_type"] not in GROUP:   # human assays only
             continue
-        con.execute("INSERT INTO chembl_adme VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        con.execute("INSERT INTO chembl_adme VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (compound_id, a["activity_id"], cid, GROUP[a["standard_type"]], a["standard_type"],
                      a.get("standard_relation"), num(a.get("standard_value")), num(a.get("standard_upper_value")),
                      a.get("standard_units"), errors(a), a.get("assay_chembl_id"), a.get("assay_description"),
-                     assay.get("assay_organism"), a.get("document_chembl_id")))
+                     assay.get("assay_organism"), assay.get("bao_label"), system(assay.get("bao_label")),
+                     a.get("document_chembl_id")))
     for a in {a["activity_id"]: a for a in binding}.values():
         con.execute("INSERT INTO chembl_binding VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (compound_id, a["activity_id"], cid, a.get("assay_chembl_id"), a.get("assay_description"),
@@ -197,23 +206,32 @@ def shown(r):
 
 
 adme["shown"] = [shown(r) for r in adme.itertuples(index=False)]
-summary = adme.groupby(["compound_id", "parameter"])["shown"].agg("; ".join).unstack()
-summary = compounds[["compound_id", "name"]].merge(
-    summary.reindex(columns=list(GROUP)).reset_index(), on="compound_id", how="left")
-summary.columns = ["compound_id", "name"] + [f"{GROUP[p]}: {p}" for p in GROUP]
+
+
+def summary(rows):
+    """Compounds x parameters, every value listed."""
+    table = rows.groupby(["compound_id", "parameter"])["shown"].agg("; ".join).unstack()
+    table = compounds[["compound_id", "name"]].merge(
+        table.reindex(columns=list(GROUP)).reset_index(), on="compound_id", how="left")
+    table.columns = ["compound_id", "name"] + [f"{GROUP[p]}: {p}" for p in GROUP]
+    return table
+
 
 named = "SELECT c.name, t.* FROM {} t JOIN compounds c USING (compound_id) ORDER BY t.compound_id"
-sheets = {
-    "Molecules": pd.read_sql(
-        "SELECT c.compound_id, c.name, c.inchikey, m.molecule_chembl_id, m.pref_name, m.max_phase, m.match_method, "
-        "(SELECT COUNT(*) FROM chembl_mechanisms x WHERE x.compound_id = c.compound_id) AS n_mechanisms, "
-        "(SELECT COUNT(*) FROM chembl_adme x WHERE x.compound_id = c.compound_id) AS n_adme_human, "
-        "(SELECT COUNT(*) FROM chembl_binding x WHERE x.compound_id = c.compound_id) AS n_binding "
-        "FROM compounds c JOIN chembl_molecules m USING (compound_id) ORDER BY c.compound_id", con),
-    "ADME summary": summary,
-}
+counts = ", ".join(f"(SELECT COUNT(*) FROM chembl_adme x WHERE x.compound_id = c.compound_id AND x.system = '{s}') "
+                   f"AS \"n_adme_{s}\"" for s in SYSTEMS)
+sheets = {"Molecules": pd.read_sql(
+    "SELECT c.compound_id, c.name, c.inchikey, m.molecule_chembl_id, m.pref_name, m.max_phase, m.match_method, "
+    "(SELECT COUNT(*) FROM chembl_mechanisms x WHERE x.compound_id = c.compound_id) AS n_mechanisms, "
+    f"{counts}, (SELECT COUNT(*) FROM chembl_binding x WHERE x.compound_id = c.compound_id) AS n_binding "
+    "FROM compounds c JOIN chembl_molecules m USING (compound_id) ORDER BY c.compound_id", con)}
+for s in SYSTEMS:
+    sheets[f"ADME {s}"] = summary(adme[adme.system == s])
 for p in GROUP:
-    sheets[f"{GROUP[p][0]} {p}".replace("/", "-")] = adme[adme.parameter == p].drop(columns="shown")
+    for s in SYSTEMS:
+        rows = adme[(adme.parameter == p) & (adme.system == s)]
+        if len(rows):
+            sheets[f"{GROUP[p][0]} {p} {s}".replace("/", "-")] = rows.drop(columns="shown")
 sheets["Mechanism targets"] = pd.read_sql(named.format("chembl_mechanisms"), con)
 sheets["Binding target summary"] = pd.read_sql(named.format("chembl_target_summary"), con)
 sheets["Binding (pChEMBL)"] = pd.read_sql(named.format("chembl_binding"), con)
@@ -222,6 +240,8 @@ sheets["Source"] = pd.DataFrame(
      ["Matching", "exact InChIKey > same skeleton > name > synonym; '_parent' = salt replaced by parent"],
      ["ADME parameters", "; ".join(f"{g}: {', '.join(p)}" for g, p in ADME.items())],
      ["ADME species", "human only (assay taxonomy 9606)"],
+     ["In vivo / in vitro", "from ChEMBL assay format: organism-based = in vivo; microsome, cell, cell-free, tissue, "
+                            "protein = in vitro; not given = unspecified (column assay_format keeps the original)"],
      ["Errors", "SD / SEM / CI copied only where ChEMBL reports them; none calculated"],
      ["Sheet names", "A = Absorption, D = Distribution, M = Metabolism, E = Excretion"],
      ["Binding", "assay type B records that have a pChEMBL value"]], columns=["Item", "Value"])
@@ -229,4 +249,5 @@ with pd.ExcelWriter(db.parent / "chembl.xlsx") as xl:
     for sheet, df in sheets.items():
         df.to_excel(xl, sheet_name=sheet, index=False)
 matched = sum(1 for r in results if r[1])
-print(f"chembl: {release}, {matched}/{len(results)} compounds matched, {len(adme)} human ADME values -> chembl.xlsx")
+split = ", ".join(f"{(adme.system == s).sum()} {s}" for s in SYSTEMS)
+print(f"chembl: {release}, {matched}/{len(results)} compounds matched, human ADME values: {split} -> chembl.xlsx")

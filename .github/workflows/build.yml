@@ -1,19 +1,91 @@
-# Database Curation on GitHub: on every upload, run `just` exactly as a fresh clone would
-# (Podman is preinstalled on GitHub's Ubuntu machines), then attach the database and spreadsheets.
+# Database Curation on GitHub: the same container and GenDB stages that `just` runs, one job per stage,
+# so the run page draws the pipeline flow. The final job attaches the database and spreadsheets.
 name: Database Curation
 on:
   push:
   workflow_dispatch:
 
+env:
+  IMAGE: localhost/database-curation:latest
+  RUN: podman run --rm -v ${{ github.workspace }}:/work -w /work localhost/database-curation:latest make -f GenDB
+
 jobs:
-  build:
+  container:
+    name: justfile + Containerfile (Podman)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - name: Install just
-        run: curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | sudo bash -s -- --to /usr/local/bin
-      - name: just
-        run: just
+      - id: cache
+        uses: actions/cache@v6
+        with: {path: image.tar, key: "container-${{ hashFiles('Containerfile', 'requirements.txt') }}"}
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: podman build -t $IMAGE -f Containerfile . && podman save -o image.tar $IMAGE
+
+  schema:
+    name: Data_Pipeline.sql
+    needs: container
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache/restore@v6
+        with: {path: image.tar, key: "container-${{ hashFiles('Containerfile', 'requirements.txt') }}", fail-on-cache-miss: true}
+      - run: podman load -q -i image.tar && $RUN schema
+      - uses: actions/upload-artifact@v7
+        with: {name: stage-schema, path: output/building.db, retention-days: 1}
+
+  rdkit:
+    name: rdkit_features.py
+    needs: schema
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache/restore@v6
+        with: {path: image.tar, key: "container-${{ hashFiles('Containerfile', 'requirements.txt') }}", fail-on-cache-miss: true}
+      - uses: actions/download-artifact@v8
+        with: {name: stage-schema, path: output}
+      - run: podman load -q -i image.tar && $RUN rdkit
+      - uses: actions/upload-artifact@v7
+        with: {name: stage-rdkit, path: "output/*.*", retention-days: 1}
+
+  chembl:
+    name: chembl.py
+    needs: rdkit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache/restore@v6
+        with: {path: image.tar, key: "container-${{ hashFiles('Containerfile', 'requirements.txt') }}", fail-on-cache-miss: true}
+      - uses: actions/download-artifact@v8
+        with: {name: stage-rdkit, path: output}
+      - run: podman load -q -i image.tar && $RUN chembl
+      - uses: actions/upload-artifact@v7
+        with: {name: stage-chembl, path: "output/*.*", retention-days: 1}
+
+  ice:
+    name: ice.py
+    needs: chembl
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache/restore@v6
+        with: {path: image.tar, key: "container-${{ hashFiles('Containerfile', 'requirements.txt') }}", fail-on-cache-miss: true}
+      - uses: actions/download-artifact@v8
+        with: {name: stage-chembl, path: output}
+      - run: podman load -q -i image.tar && $RUN ice
+      - uses: actions/upload-artifact@v7
+        with: {name: stage-ice, path: "output/*.*", retention-days: 1}
+
+  database:
+    name: ooc_drug_ml.db + spreadsheets
+    needs: ice
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache/restore@v6
+        with: {path: image.tar, key: "container-${{ hashFiles('Containerfile', 'requirements.txt') }}", fail-on-cache-miss: true}
+      - uses: actions/download-artifact@v8
+        with: {name: stage-ice, path: output}
+      - run: podman load -q -i image.tar && $RUN database
       - uses: actions/upload-artifact@v7
         with:
           name: database-and-spreadsheets
