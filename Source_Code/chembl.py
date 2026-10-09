@@ -135,6 +135,35 @@ def errors(record):
     return "; ".join(found) or None
 
 
+# Study details: column -> ChEMBL property / assay parameter names, copied as reported.
+DETAILS = {"dosed_drug": ["DOSED_COMPOUND_NAME"], "interacting_drug": ["INTERACTING_COMPOUND"],
+           "health_status": ["HEALTH_STATUS"], "gender": ["GENDER"], "n_subjects": ["N"],
+           "age_range": ["AGE_RANGE"], "dietary_status": ["DIETARY_STATUS"], "dose": ["DOSE"], "route": ["ROUTE"],
+           "regimen": ["REGIMEN"], "formulation": ["FORMULATION", "DOSAGE_FORM"], "sample_tissue": ["TISSUE"]}
+
+
+def details(record, assay):
+    """Study details from the value's properties, else from its assay's parameters."""
+    def read(items):
+        out = {}
+        for p in items or []:
+            kind = (p.get("standard_type") or p.get("type") or "").upper()
+            text = p.get("standard_text_value") or p.get("text_value")
+            if text is None:
+                value = num(p.get("standard_value") if p.get("standard_value") is not None else p.get("value"))
+                text = None if value is None else f"{value:g} {p.get('standard_units') or p.get('units') or ''}".strip()
+            if text:
+                out.setdefault(kind, []).append(str(text))
+        return out
+    own, study = read(record.get("activity_properties")), read(assay.get("assay_parameters"))
+    row = {}
+    for column, kinds in DETAILS.items():
+        values = next((own[k] for k in kinds if k in own), None) or next((study[k] for k in kinds if k in study), [])
+        row[column] = "; ".join(dict.fromkeys(values)) or None
+    row["sample_tissue"] = row["sample_tissue"] or assay.get("assay_tissue")
+    return row
+
+
 con = sqlite3.connect(db)
 compounds = pd.read_sql("SELECT compound_id, name, inchikey FROM compounds ORDER BY compound_id", con)
 status = get("status")
@@ -156,7 +185,7 @@ targets = lookup("target", "targets", "target_chembl_id",
                  {x["target_chembl_id"] for r in results for x in r[3] if x.get("target_chembl_id")},
                  "target_chembl_id,pref_name,target_type,organism")
 assays = lookup("assay", "assays", "assay_chembl_id", {a["assay_chembl_id"] for r in results for a in r[4]},
-                "assay_chembl_id,assay_organism,assay_tax_id,bao_label")
+                "assay_chembl_id,assay_organism,assay_tax_id,bao_label,assay_tissue,assay_parameters")
 
 
 def system(fmt):
@@ -176,12 +205,16 @@ for compound_id, m, method, mechanisms, adme, binding in results:
         assay = assays.get(a["assay_chembl_id"], {})
         if str(assay.get("assay_tax_id")) != "9606" or a["standard_type"] not in GROUP:   # human assays only
             continue
-        con.execute("INSERT INTO chembl_adme VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (compound_id, a["activity_id"], cid, GROUP[a["standard_type"]], a["standard_type"],
-                     a.get("standard_relation"), num(a.get("standard_value")), num(a.get("standard_upper_value")),
-                     a.get("standard_units"), errors(a), a.get("assay_chembl_id"), a.get("assay_description"),
-                     assay.get("assay_organism"), assay.get("bao_label"), system(assay.get("bao_label")),
-                     a.get("document_chembl_id")))
+        row = {"compound_id": compound_id, "activity_id": a["activity_id"], "molecule_chembl_id": cid,
+               "adme_group": GROUP[a["standard_type"]], "parameter": a["standard_type"],
+               "relation": a.get("standard_relation"), "value": num(a.get("standard_value")),
+               "upper_value": num(a.get("standard_upper_value")), "units": a.get("standard_units"),
+               "error_reported": errors(a), "assay_chembl_id": a.get("assay_chembl_id"),
+               "assay_description": a.get("assay_description"), "assay_organism": assay.get("assay_organism"),
+               "assay_format": assay.get("bao_label"), "system": system(assay.get("bao_label")),
+               **details(a, assay), "document_chembl_id": a.get("document_chembl_id")}
+        con.execute(f"INSERT INTO chembl_adme ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})",
+                    list(row.values()))
     for a in {a["activity_id"]: a for a in binding}.values():
         con.execute("INSERT INTO chembl_binding VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (compound_id, a["activity_id"], cid, a.get("assay_chembl_id"), a.get("assay_description"),
@@ -243,6 +276,9 @@ sheets["Source"] = pd.DataFrame(
      ["In vivo / in vitro", "from ChEMBL assay format: organism-based = in vivo; microsome, cell, cell-free, tissue, "
                             "protein = in vitro; not given = unspecified (column assay_format keeps the original)"],
      ["Errors", "SD / SEM / CI copied only where ChEMBL reports them; none calculated"],
+     ["Study details", "dosed_drug, interacting_drug, health_status, gender, n_subjects, age_range, dietary_status, "
+                       "dose, route, regimen, formulation, sample_tissue: as reported by ChEMBL for the value, "
+                       "else for its assay; blank when not reported"],
      ["Sheet names", "A = Absorption, D = Distribution, M = Metabolism, E = Excretion"],
      ["Binding", "assay type B records that have a pChEMBL value"]], columns=["Item", "Value"])
 with pd.ExcelWriter(db.parent / "chembl.xlsx") as xl:

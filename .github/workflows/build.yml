@@ -11,7 +11,7 @@ env:
 
 jobs:
   container:
-    name: justfile + Containerfile (Podman)
+    name: "1. Podman container (justfile + Containerfile)"
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -22,7 +22,7 @@ jobs:
         run: podman build -t $IMAGE -f Containerfile . && podman save -o image.tar $IMAGE
 
   schema:
-    name: Data_Pipeline.sql
+    name: "2. Empty database tables (Data_Pipeline.sql)"
     needs: container
     runs-on: ubuntu-24.04
     steps:
@@ -34,7 +34,7 @@ jobs:
         with: {name: stage-schema, path: output/building.db, retention-days: 1}
 
   rdkit:
-    name: rdkit_features.py
+    name: "3. RDKit descriptors + Morgan fingerprints (rdkit_features.py)"
     needs: schema
     runs-on: ubuntu-24.04
     steps:
@@ -48,7 +48,7 @@ jobs:
         with: {name: stage-rdkit, path: "output/*.*", retention-days: 1}
 
   chembl:
-    name: chembl.py
+    name: "4. ChEMBL targets + human ADME (chembl.py)"
     needs: rdkit
     runs-on: ubuntu-24.04
     steps:
@@ -62,7 +62,7 @@ jobs:
         with: {name: stage-chembl, path: "output/*.*", retention-days: 1}
 
   ice:
-    name: ice.py
+    name: "5. ICE plasma fraction unbound (ice.py)"
     needs: chembl
     runs-on: ubuntu-24.04
     steps:
@@ -76,7 +76,7 @@ jobs:
         with: {name: stage-ice, path: "output/*.*", retention-days: 1}
 
   database:
-    name: ooc_drug_ml.db + spreadsheets
+    name: "6. Final database + spreadsheets (ooc_drug_ml.db)"
     needs: ice
     runs-on: ubuntu-24.04
     steps:

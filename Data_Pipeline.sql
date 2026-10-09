@@ -74,6 +74,19 @@ CREATE TABLE chembl_adme (
   assay_organism     TEXT,
   assay_format       TEXT,            -- ChEMBL BAO format, e.g. organism-based, microsome, cell-based
   system             TEXT NOT NULL CHECK (system IN ('in vivo', 'in vitro', 'unspecified')),
+  -- Study details exactly as ChEMBL reports them (value first, then assay); blank when not given.
+  dosed_drug         TEXT,            -- drug actually given, e.g. a salt, prodrug or the parent of a metabolite
+  interacting_drug   TEXT,            -- co-administered drug
+  health_status      TEXT,            -- e.g. healthy, cancer
+  gender             TEXT,
+  n_subjects         TEXT,
+  age_range          TEXT,
+  dietary_status     TEXT,            -- fed / fasting
+  dose               TEXT,
+  route              TEXT,
+  regimen            TEXT,            -- single / multiple dose
+  formulation        TEXT,
+  sample_tissue      TEXT,            -- plasma, urine, bile
   document_chembl_id TEXT,
   PRIMARY KEY (compound_id, activity_id)
 );
